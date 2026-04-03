@@ -1,17 +1,9 @@
-name: Milkbasket PO Scheduler
+name: Milkbasket GRN Scheduler
 
 on:
-  # Run every 3 hours
   schedule:
-    - cron: '0 */3 * * *'
-
-  # Allow manual triggering from GitHub UI
-  workflow_dispatch:
-
-# Built-in GITHUB_TOKEN needs secrets:write to update the token secret
-permissions:
-  contents: read
-  secrets: write
+    - cron: '0 */3 * * *'  # Every 3 hours
+  workflow_dispatch:        # Allow manual trigger from GitHub UI
 
 jobs:
   run-scheduler:
@@ -35,75 +27,68 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 4. Decode token secret → token.json on disk
-      #    app.py reads this file to authenticate and writes it back after any refresh
-      - name: Restore Google token
+      # 4. Decode and restore credentials
+      - name: Restore Google credentials
         env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           GOOGLE_TOKEN: ${{ secrets.GOOGLE_TOKEN }}
         run: |
+          echo "$GOOGLE_CREDENTIALS" | base64 -d > credentials.json
           echo "$GOOGLE_TOKEN" | base64 -d > token.json
-          echo "✅ token.json restored"
+          echo "✅ Credentials restored"
 
-      # 5. Run the workflow (single execution — cron above handles scheduling)
+      # 5. Set environment variables
+      - name: Set environment variables
+        run: |
+          echo "LLAMA_CLOUD_API_KEY=${{ secrets.LLAMA_API_KEY }}" >> $GITHUB_ENV
+
+      # 6. Run the workflow
       - name: Run workflow
-        env:
-          LLAMA_CLOUD_API_KEY: ${{ secrets.LLAMA_API_KEY }}
         run: |
-          echo "🚀 Starting Milkbasket PO workflow..."
-          python app.py
+          echo "🚀 Starting Milkbasket GRN workflow..."
+          python -c "
+          from app import MilkbasketAutomation
+          automation = MilkbasketAutomation()
+          if automation.authenticate():
+              automation.run_scheduled_workflow()
+          else:
+              print('❌ Authentication failed')
+              exit(1)
+          "
 
-      # 6. Push the (possibly refreshed) token.json back to the secret.
-      #    Uses the built-in GITHUB_TOKEN + GitHub REST API — no PAT required.
-      #    Runs with if: always() so a mid-run refresh is never lost.
-      - name: Save refreshed token back to secret
-        if: always()
+      # 7. Check if token was refreshed and update secret
+      - name: Check if token was updated
+        id: check_token
         run: |
-          if [ ! -f token.json ]; then
-            echo "token.json not found — skipping secret update"
-            exit 0
+          if [ -f token.json ]; then
+            NEW_TOKEN=$(base64 -w 0 token.json)
+            echo "token_updated=true" >> $GITHUB_OUTPUT
+            echo "new_token=$NEW_TOKEN" >> $GITHUB_OUTPUT
+          else
+            echo "token_updated=false" >> $GITHUB_OUTPUT
           fi
 
-          NEW_TOKEN=$(base64 -w 0 token.json)
-
-          # Fetch the repo's public key (required to encrypt secrets via the API)
-          PUB_KEY_RESPONSE=$(gh api repos/${{ github.repository }}/actions/secrets/public-key)
-          KEY_ID=$(echo "$PUB_KEY_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['key_id'])")
-          PUB_KEY=$(echo "$PUB_KEY_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['key'])")
-
-          # Encrypt the token value with the repo's libsodium public key
-          pip install PyNaCl -q
-          ENCRYPTED=$(PUB_KEY="$PUB_KEY" NEW_TOKEN="$NEW_TOKEN" python3 - <<'PYEOF'
-          import sys, base64, os
-          from nacl import encoding, public
-          public_key = public.PublicKey(os.environ["PUB_KEY"].encode(), encoding.Base64Encoder)
-          encrypted = public.SealedBox(public_key).encrypt(os.environ["NEW_TOKEN"].encode())
-          print(base64.b64encode(encrypted).decode())
-          PYEOF
-          )
-
-          # Update the secret via the REST API
-          gh api \
-            --method PUT \
-            repos/${{ github.repository }}/actions/secrets/GOOGLE_TOKEN \
-            -f key_id="$KEY_ID" \
-            -f encrypted_value="$ENCRYPTED"
-
-          echo "✅ GOOGLE_TOKEN secret updated successfully"
+      # 8. Persist refreshed token back to GitHub Secrets
+      - name: Update GOOGLE_TOKEN secret if refreshed
+        if: steps.check_token.outputs.token_updated == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh secret set GOOGLE_TOKEN --body "${{ steps.check_token.outputs.new_token }}"
+          echo "🔄 Token secret updated"
 
-      # 7. Cleanup — remove credentials from the runner
+      # 9. Cleanup credentials from runner
       - name: Cleanup credentials
         if: always()
         run: |
-          rm -f token.json
+          rm -f credentials.json token.json
           echo "🧹 Cleaned up temporary files"
 
-      # 8. Upload logs as artifact
+      # 10. Upload logs as artifact
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: milkbasket-workflow-logs-${{ github.run_number }}
-          path: "*.log"
+          path: hyperpure_automation.log
           retention-days: 30
