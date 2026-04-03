@@ -1,39 +1,48 @@
+#!/usr/bin/env python3
+"""
+Milkbasket GRN Automation - GitHub Actions Compatible
+Runs Gmail → Drive and Drive → Sheet workflows every 3 hours via GitHub Actions scheduler.
+"""
+
 import os
-import sys
 import json
 import base64
 import tempfile
 import time
 import logging
+import schedule
+import re
+import warnings
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 from io import BytesIO
-import re
 
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+import io
 
-# === NEW LLAMA CLOUD SDK ===
+# === LLAMA CLOUD SDK ===
 try:
     from llama_cloud import LlamaCloud
     LLAMA_AVAILABLE = True
 except ImportError:
     LLAMA_AVAILABLE = False
+    print("WARNING: llama_cloud not available. Run: pip install llama-cloud>=2.1")
 
-# Custom SUCCESS log level
-logging.SUCCESS = 25
-logging.addLevelName(logging.SUCCESS, "SUCCESS")
+warnings.filterwarnings("ignore")
 
-def success(self, message, *args, **kwargs):
-    if self.isEnabledFor(logging.SUCCESS):
-        self._log(logging.SUCCESS, message, args, **kwargs)
-
-logging.Logger.success = success
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+# Configure logging — file + stdout (GitHub Actions captures both)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('hyperpure_automation.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # Hardcoded configuration
@@ -47,19 +56,26 @@ CONFIG = {
     },
     'pdf': {
         'drive_folder_id': "1oRc5usVewCoAiq6uKpgY7G6xtAO_6Hz3",
-        'llama_api_key': "llx-fscu1pzDJ2LATNBsIhXXrqmde8ajmQVx3LQ6eStBCjQr2WhF",
+        'llama_api_key': os.environ.get('LLAMA_CLOUD_API_KEY', 'llx-fscu1pzDJ2LATNBsIhXXrqmde8ajmQVx3LQ6eStBCjQr2WhF'),
         'llama_agent': "HyperPO",
         'spreadsheet_id': "1ZfKCYAaUJCSw2g-yTC9zxxYyZ4h5Ffyn2mUvA7aFufU",
         'sheet_range': "pos",
         'days_back': 1,
-        'max_files': 10
+        'max_files': 10,
+        'failed_extractions_sheet': 'failed_extractions'
     },
-    'log': {
+    'workflow_log': {
+        'spreadsheet_id': "1ZfKCYAaUJCSw2g-yTC9zxxYyZ4h5Ffyn2mUvA7aFufU",
         'sheet_range': "workflow_logs"
-    }
+    },
+    'remaining_files': {
+        'spreadsheet_id': "1ZfKCYAaUJCSw2g-yTC9zxxYyZ4h5Ffyn2mUvA7aFufU",
+        'sheet_range': "remaining_files"
+    },
+    'credentials_path': 'credentials.json',
+    'token_path': 'token.json'
 }
 
-TOKEN_FILE = 'token.json'
 MAX_RETRIES = 3
 RETRY_WAIT = 2
 
@@ -69,89 +85,88 @@ class MilkbasketAutomation:
         self.gmail_service = None
         self.drive_service = None
         self.sheets_service = None
-        
+
         self.gmail_scopes = ['https://www.googleapis.com/auth/gmail.readonly']
-        self.drive_scopes = ['https://www.googleapis.com/auth/drive.file']
+        self.drive_scopes = ['https://www.googleapis.com/auth/drive']
         self.sheets_scopes = ['https://www.googleapis.com/auth/spreadsheets']
-        
+
         self.logs = []
         self.current_stats = {
             'gmail': {'processed_emails': 0, 'total_attachments': 0, 'successful_uploads': 0, 'failed_uploads': 0},
             'pdf': {'total_pdfs': 0, 'processed_pdfs': 0, 'skipped_pdfs': 0, 'failed_pdfs': 0, 'rows_added': 0}
         }
-    
+
+    # ─────────────────────────── Logging helpers ────────────────────────────
+
     def log(self, message: str, level: str = "INFO"):
+        if level.upper() == "ERROR":
+            logging.error(message)
+        elif level.upper() == "WARNING":
+            logging.warning(message)
+        elif level.upper() == "SUCCESS":
+            logging.info(f"✅ {message}")
+        else:
+            logging.info(message)
+
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_entry = {"timestamp": timestamp, "level": level.upper(), "message": message}
-        self.logs.append(log_entry)
-        if len(self.logs) > 100:
-            self.logs = self.logs[-100:]
-        level_map = {"INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR, "SUCCESS": logging.SUCCESS}
-        logger.log(level_map.get(level.upper(), logging.INFO), message)
-    
+        self.logs.append({"timestamp": timestamp, "level": level.upper(), "message": message})
+        if len(self.logs) > 200:
+            self.logs = self.logs[-200:]
+
     def get_logs(self): return self.logs
     def clear_logs(self): self.logs = []
+
     def reset_stats(self):
         self.current_stats = {
             'gmail': {'processed_emails': 0, 'total_attachments': 0, 'successful_uploads': 0, 'failed_uploads': 0},
             'pdf': {'total_pdfs': 0, 'processed_pdfs': 0, 'skipped_pdfs': 0, 'failed_pdfs': 0, 'rows_added': 0}
         }
+
     def get_stats(self): return self.current_stats
 
+    # ──────────────────────────── Authentication ────────────────────────────
+
     def authenticate(self):
-        """
-        Authenticate using a token.json file on disk.
-
-        In GitHub Actions the workflow decodes the GOOGLE_TOKEN secret into
-        token.json before this runs. After a successful refresh the updated
-        token is written back to token.json so the workflow can push it back
-        to the secret — keeping credentials perpetually valid without an
-        interactive OAuth flow or a separate PAT.
-
-        For local development just have a valid token.json present (generated
-        once by running the original OAuth flow locally).
-        """
+        """Authenticate using credentials.json / token.json (pre-restored by GitHub Actions)."""
         try:
             self.log("Starting authentication process...", "INFO")
             combined_scopes = list(set(self.gmail_scopes + self.drive_scopes + self.sheets_scopes))
 
-            if not os.path.exists(TOKEN_FILE):
-                self.log(
-                    f"token.json not found at '{TOKEN_FILE}'. "
-                    "In GitHub Actions ensure the GOOGLE_TOKEN secret is set. "
-                    "Locally, run the OAuth flow once to generate token.json.",
-                    "ERROR"
-                )
-                return False
+            creds = None
+            if os.path.exists(CONFIG['token_path']):
+                creds = Credentials.from_authorized_user_file(CONFIG['token_path'], combined_scopes)
 
-            creds = Credentials.from_authorized_user_file(TOKEN_FILE, combined_scopes)
-
-            if not creds.valid:
-                if creds.expired and creds.refresh_token:
-                    self.log("Token expired — refreshing...", "INFO")
+            if not creds or not creds.valid:
+                if creds and creds.expired and creds.refresh_token:
+                    self.log("Refreshing expired token...", "INFO")
                     creds.refresh(Request())
-                    self.log("Token refreshed successfully.", "INFO")
+                    # Persist refreshed token so GitHub Actions can capture it
+                    with open(CONFIG['token_path'], 'w') as token:
+                        token.write(creds.to_json())
+                    self.log("Token refreshed and saved.", "INFO")
                 else:
-                    self.log(
-                        "Token is invalid and has no refresh_token. "
-                        "Re-run the local OAuth flow to generate a fresh token.json.",
-                        "ERROR"
-                    )
-                    return False
+                    if not os.path.exists(CONFIG['credentials_path']):
+                        self.log(f"credentials.json not found at '{CONFIG['credentials_path']}'", "ERROR")
+                        return False
+                    self.log("Starting new OAuth flow (local only — not supported in CI)...", "INFO")
+                    flow = InstalledAppFlow.from_client_secrets_file(CONFIG['credentials_path'], combined_scopes)
+                    creds = flow.run_local_server(port=0)
+                    with open(CONFIG['token_path'], 'w') as token:
+                        token.write(creds.to_json())
+                    self.log("OAuth authentication successful!", "SUCCESS")
 
-            # Always persist so the workflow can read and update the secret
-            with open(TOKEN_FILE, 'w') as fh:
-                fh.write(creds.to_json())
-            self.log("Token saved to token.json.", "INFO")
-
-            self.gmail_service  = build('gmail',  'v1', credentials=creds)
-            self.drive_service  = build('drive',  'v3', credentials=creds)
+            self.gmail_service = build('gmail', 'v1', credentials=creds)
+            self.drive_service = build('drive', 'v3', credentials=creds)
             self.sheets_service = build('sheets', 'v4', credentials=creds)
+
             self.log("Authentication successful!", "INFO")
             return True
+
         except Exception as e:
             self.log(f"Authentication failed: {str(e)}", "ERROR")
             return False
+
+    # ─────────────────────────── Retry wrapper ──────────────────────────────
 
     def retry_wrapper(self, func, *args, **kwargs):
         for attempt in range(1, MAX_RETRIES + 1):
@@ -164,7 +179,10 @@ class MilkbasketAutomation:
                 else:
                     raise
 
-    def search_emails(self, sender: str = "", search_term: str = "", days_back: int = 7, max_results: int = 50) -> List[Dict]:
+    # ───────────────────────── Gmail → Drive workflow ───────────────────────
+
+    def search_emails(self, sender: str = "", search_term: str = "",
+                      days_back: int = 7, max_results: int = 50) -> List[Dict]:
         def _search():
             query_parts = ["has:attachment"]
             if sender:
@@ -180,10 +198,12 @@ class MilkbasketAutomation:
             start_date = datetime.now() - timedelta(days=days_back)
             query_parts.append(f"after:{start_date.strftime('%Y/%m/%d')}")
             query = " ".join(query_parts)
-            self.log(f"Searching Gmail with query: {query}", "INFO")
-            result = self.gmail_service.users().messages().list(userId='me', q=query, maxResults=max_results).execute()
+            self.log(f"Gmail search query: {query}", "INFO")
+            result = self.gmail_service.users().messages().list(
+                userId='me', q=query, maxResults=max_results
+            ).execute()
             messages = result.get('messages', [])
-            self.log(f"Gmail search returned {len(messages)} messages", "INFO")
+            self.log(f"Found {len(messages)} emails matching criteria", "INFO")
             return messages
         try:
             return self.retry_wrapper(_search)
@@ -191,120 +211,11 @@ class MilkbasketAutomation:
             self.log(f"Email search failed: {str(e)}", "ERROR")
             return []
 
-    def get_existing_filenames(self, spreadsheet_id: str, sheet_range: str) -> set:
+    def get_email_details(self, message_id: str) -> Dict:
         try:
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id, range=sheet_range, majorDimension="ROWS"
+            message = self.gmail_service.users().messages().get(
+                userId='me', id=message_id, format='metadata'
             ).execute()
-            values = result.get('values', [])
-            if not values:
-                return set()
-            headers = values[0]
-            if "source_file" not in headers:
-                return set()
-            id_index = headers.index("source_file")
-            existing_ids = {row[id_index] for row in values[1:] if len(row) > id_index and row[id_index]}
-            self.log(f"Found {len(existing_ids)} existing file names in sheet", "INFO")
-            return existing_ids
-        except Exception as e:
-            self.log(f"Failed to get existing file names: {str(e)}", "ERROR")
-            return set()
-
-    def get_existing_file_ids(self, spreadsheet_id: str, sheet_range: str) -> set:
-        try:
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id, range=sheet_range, majorDimension="ROWS"
-            ).execute()
-            values = result.get('values', [])
-            if not values:
-                return set()
-            headers = values[0]
-            if "drive_file_id" not in headers:
-                return set()
-            id_index = headers.index("drive_file_id")
-            existing_ids = {row[id_index] for row in values[1:] if len(row) > id_index and row[id_index]}
-            self.log(f"Found {len(existing_ids)} existing file IDs in sheet", "INFO")
-            return existing_ids
-        except Exception as e:
-            self.log(f"Failed to get existing file IDs: {str(e)}", "ERROR")
-            return set()
-
-    def process_gmail_workflow(self, config: dict, progress_callback=None, status_callback=None):
-        try:
-            if status_callback: status_callback("Starting Gmail workflow...")
-            self.log("Starting Gmail workflow", "INFO")
-            if progress_callback: progress_callback(10)
-
-            emails = self.search_emails(
-                sender=config['sender'],
-                search_term=config['search_term'],
-                days_back=config['days_back'],
-                max_results=config['max_results']
-            )
-            self.current_stats['gmail']['processed_emails'] = len(emails)
-
-            if progress_callback: progress_callback(25)
-            if not emails:
-                self.log("No emails found matching criteria", "WARNING")
-                return {'success': True, 'processed': 0}
-
-            if status_callback: status_callback(f"Found {len(emails)} emails. Processing attachments...")
-            self.log(f"Found {len(emails)} emails matching criteria", "INFO")
-
-            base_folder_name = "Gmail_Attachments"
-            base_folder_id = self._create_drive_folder(base_folder_name, config.get('gdrive_folder_id'))
-
-            if not base_folder_id:
-                self.log("Failed to create base folder in Google Drive", "ERROR")
-                return {'success': False, 'processed': 0}
-
-            if progress_callback: progress_callback(50)
-
-            processed_count = 0
-            total_attachments = 0
-
-            for i, email in enumerate(emails):
-                try:
-                    if status_callback: status_callback(f"Processing email {i+1}/{len(emails)}")
-                    email_details = self._get_email_details(email['id'])
-                    subject = email_details.get('subject', 'No Subject')[:50]
-
-                    inv_match = re.search(r'against Inv: (\S+)', subject)
-                    if inv_match and '/' in inv_match.group(1):
-                        self.log(f"Skipping email (contains '/'): {subject}", "INFO")
-                        continue
-
-                    self.log(f"Processing email: {subject}", "INFO")
-
-                    message = self.gmail_service.users().messages().get(userId='me', id=email['id'], format='full').execute()
-                    attachment_count = self._extract_attachments_from_email(email['id'], message['payload'], config, base_folder_id)
-
-                    total_attachments += attachment_count
-                    self.current_stats['gmail']['total_attachments'] += attachment_count
-                    self.current_stats['gmail']['successful_uploads'] += attachment_count
-
-                    if attachment_count > 0:
-                        processed_count += 1
-                        self.log(f"Found {attachment_count} attachments", "SUCCESS")
-                    
-                    if progress_callback:
-                        progress = 50 + (i + 1) / len(emails) * 45
-                        progress_callback(int(progress))
-                except Exception as e:
-                    self.log(f"Failed to process email: {str(e)}", "ERROR")
-                    self.current_stats['gmail']['failed_uploads'] += 1
-
-            if progress_callback: progress_callback(100)
-            if status_callback: status_callback(f"Gmail workflow completed! Processed {total_attachments} attachments")
-            self.log(f"Gmail workflow completed! Processed {total_attachments} attachments from {processed_count} emails", "SUCCESS")
-            return {'success': True, 'processed': total_attachments}
-        except Exception as e:
-            self.log(f"Gmail workflow failed: {str(e)}", "ERROR")
-            return {'success': False, 'processed': 0}
-
-    def _get_email_details(self, message_id: str) -> Dict:
-        try:
-            message = self.gmail_service.users().messages().get(userId='me', id=message_id, format='metadata').execute()
             headers = message['payload'].get('headers', [])
             return {
                 'id': message_id,
@@ -324,15 +235,41 @@ class MilkbasketAutomation:
             existing = self.drive_service.files().list(q=query, fields='files(id, name)').execute()
             if existing.get('files'):
                 return existing['files'][0]['id']
-            
             folder_metadata = {'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder'}
             if parent_folder_id:
                 folder_metadata['parents'] = [parent_folder_id]
             folder = self.drive_service.files().create(body=folder_metadata, fields='id').execute()
             return folder.get('id')
         except Exception as e:
-            self.log(f"Failed to create folder {folder_name}: {str(e)}", "ERROR")
+            self.log(f"Failed to create folder '{folder_name}': {str(e)}", "ERROR")
             return ""
+
+    def _file_exists_in_folder(self, filename: str, folder_id: str) -> bool:
+        try:
+            query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
+            files = self.drive_service.files().list(q=query, fields='files(id, name)').execute().get('files', [])
+            return len(files) > 0
+        except Exception:
+            return False
+
+    def _sanitize_filename(self, filename: str) -> str:
+        cleaned = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        if len(cleaned) > 100:
+            parts = cleaned.split('.')
+            cleaned = f"{'.'.join(parts[:-1])[:95]}.{parts[-1]}" if len(parts) > 1 else cleaned[:100]
+        return cleaned
+
+    def _classify_extension(self, filename: str) -> str:
+        if not filename or '.' not in filename:
+            return "Other"
+        ext = filename.split(".")[-1].lower()
+        return {
+            "pdf": "PDFs", "doc": "Documents", "docx": "Documents", "txt": "Documents",
+            "xls": "Spreadsheets", "xlsx": "Spreadsheets", "csv": "Spreadsheets",
+            "jpg": "Images", "jpeg": "Images", "png": "Images", "gif": "Images",
+            "ppt": "Presentations", "pptx": "Presentations",
+            "zip": "Archives", "rar": "Archives", "7z": "Archives",
+        }.get(ext, "Other")
 
     def _extract_attachments_from_email(self, message_id: str, payload: Dict, config: dict, base_folder_id: str) -> int:
         processed_count = 0
@@ -343,7 +280,9 @@ class MilkbasketAutomation:
             filename = payload.get("filename", "")
             try:
                 attachment_id = payload["body"].get("attachmentId")
-                att = self.gmail_service.users().messages().attachments().get(userId='me', messageId=message_id, id=attachment_id).execute()
+                att = self.gmail_service.users().messages().attachments().get(
+                    userId='me', messageId=message_id, id=attachment_id
+                ).execute()
                 file_data = base64.urlsafe_b64decode(att["data"].encode("UTF-8"))
 
                 search_folder_id = self._create_drive_folder(config.get('search_term', 'all-attachments'), base_folder_id)
@@ -359,289 +298,305 @@ class MilkbasketAutomation:
                 else:
                     self.log(f"File already exists, skipping: {clean_filename}", "INFO")
             except Exception as e:
-                self.log(f"Failed to process attachment {filename}: {str(e)}", "ERROR")
+                self.log(f"Failed to process attachment '{filename}': {str(e)}", "ERROR")
         return processed_count
 
-    def _sanitize_filename(self, filename: str) -> str:
-        cleaned = re.sub(r'[<>:"/\|?*]', '_', filename)
-        if len(cleaned) > 100:
-            name_parts = cleaned.split('.')
-            if len(name_parts) > 1:
-                cleaned = f"{'.'.join(name_parts[:-1])[:95]}.{name_parts[-1]}"
-            else:
-                cleaned = cleaned[:100]
-        return cleaned
-
-    def _classify_extension(self, filename: str) -> str:
-        if not filename or '.' not in filename:
-            return "Other"
-        ext = filename.split(".")[-1].lower()
-        type_map = {
-            "pdf": "PDFs", "doc": "Documents", "docx": "Documents", "txt": "Documents",
-            "xls": "Spreadsheets", "xlsx": "Spreadsheets", "csv": "Spreadsheets",
-            "jpg": "Images", "jpeg": "Images", "png": "Images", "gif": "Images",
-            "ppt": "Presentations", "pptx": "Presentations",
-            "zip": "Archives", "rar": "Archives", "7z": "Archives",
-        }
-        return type_map.get(ext, "Other")
-
-    def _file_exists_in_folder(self, filename: str, folder_id: str) -> bool:
+    def process_gmail_workflow(self, config: dict, progress_callback=None, status_callback=None):
         try:
-            query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
-            files = self.drive_service.files().list(q=query, fields='files(id, name)').execute().get('files', [])
-            return len(files) > 0
-        except:
-            return False
+            if status_callback: status_callback("Starting Gmail workflow...")
+            self.log("Starting Gmail workflow", "INFO")
+            if progress_callback: progress_callback(10)
 
-    # ====================== UPDATED PDF WORKFLOW (FIXED) ======================
-    def process_pdf_workflow(self, config: dict, progress_callback=None, status_callback=None):
-        try:
-            if not LLAMA_AVAILABLE:
-                self.log("llama-cloud not installed. Run: pip install llama-cloud>=2.1", "ERROR")
-                return {'success': False, 'processed': 0}
+            emails = self.search_emails(
+                sender=config['sender'],
+                search_term=config['search_term'],
+                days_back=config['days_back'],
+                max_results=config['max_results']
+            )
+            self.current_stats['gmail']['processed_emails'] = len(emails)
 
-            if status_callback: status_callback("Starting PDF processing workflow...")
-            self.log("Starting PDF processing workflow with llama-cloud SDK...", "INFO")
-            if progress_callback: progress_callback(20)
+            if progress_callback: progress_callback(25)
+            if not emails:
+                self.log("No emails found matching criteria", "WARNING")
+                return {'success': True, 'processed': 0, 'total_attachments': 0, 'failed': 0, 'emails_processed': 0}
 
-            client = LlamaCloud(api_key=config['llama_api_key'])
+            self.log(f"Found {len(emails)} emails. Processing attachments...", "INFO")
 
-            if progress_callback: progress_callback(40)
+            base_folder_id = self._create_drive_folder("Gmail_Attachments", config.get('gdrive_folder_id'))
+            if not base_folder_id:
+                self.log("Failed to create base folder in Google Drive", "ERROR")
+                return {'success': False, 'processed': 0, 'total_attachments': 0, 'failed': 0, 'emails_processed': 0}
 
-            # Always fetch existing file IDs and filenames to prevent any duplication
-            existing_file_ids = self.get_existing_file_ids(config['spreadsheet_id'], config['sheet_range'])
-            existing_file_names = self.get_existing_filenames(config['spreadsheet_id'], config['sheet_range'])
-            pdf_files = self._list_drive_files(config['drive_folder_id'], config['days_back'])
-            self.current_stats['pdf']['total_pdfs'] = len(pdf_files)
-
-            skipped = []
-            files_to_process = []
-            for f in pdf_files:
-                if f['id'] in existing_file_ids:
-                    self.log(f"Skipping (drive_file_id already in sheet): {f['name']}", "INFO")
-                    skipped.append(f)
-                elif f['name'] in existing_file_names:
-                    self.log(f"Skipping (filename already in sheet): {f['name']}", "INFO")
-                    skipped.append(f)
-                else:
-                    files_to_process.append(f)
-
-            self.current_stats['pdf']['skipped_pdfs'] += len(skipped)
-            files_to_process = files_to_process[:config.get('max_files', len(files_to_process))]
-
-            if not files_to_process:
-                self.log("No PDF files to process", "WARNING")
-                return {'success': True, 'processed': 0}
-
-            self.log(f"Processing {len(files_to_process)} PDFs using agent '{config['llama_agent']}'", "INFO")
+            if progress_callback: progress_callback(50)
 
             processed_count = 0
-            total_rows = 0
-            sheet_name = config['sheet_range'].split('!')[0]
+            total_attachments = 0
+            failed_count = 0
 
-            for i, file in enumerate(files_to_process):
+            for i, email in enumerate(emails):
                 try:
-                    if status_callback: status_callback(f"Processing PDF {i+1}/{len(files_to_process)}: {file['name']}")
-                    self.log(f"Processing: {file['name']}", "INFO")
+                    if status_callback: status_callback(f"Processing email {i+1}/{len(emails)}")
+                    email_details = self.get_email_details(email['id'])
+                    subject = email_details.get('subject', 'No Subject')[:50]
 
-                    pdf_data = self._download_from_drive(file['id'], file['name'])
-                    if not pdf_data:
-                        self.current_stats['pdf']['failed_pdfs'] += 1
+                    inv_match = re.search(r'against Inv: (\S+)', subject)
+                    if inv_match and '/' in inv_match.group(1):
+                        self.log(f"Skipping email (contains '/'): {subject}", "INFO")
                         continue
 
-                    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
-                        temp_file.write(pdf_data)
-                        temp_path = temp_file.name
+                    self.log(f"Processing email: {subject}", "INFO")
+                    message = self.gmail_service.users().messages().get(
+                        userId='me', id=email['id'], format='full'
+                    ).execute()
+                    attachment_count = self._extract_attachments_from_email(
+                        email['id'], message['payload'], config, base_folder_id
+                    )
 
-                    extracted_data = None
-                    try:
-                        # Upload file
-                        with open(temp_path, "rb") as f:
-                            file_obj = client.files.create(file=f, purpose="extract")
-                        file_id = file_obj.id
-
-                        # Create extraction job with your HyperPO agent
-                        job = client.extract.create(
-                            file_input=file_id,
-                            configuration={
-                                "agent_name": config['llama_agent'],
-                                "extraction_target": "per_doc",
-                                "tier": "agentic",
-                                "data_schema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "purchase_order_number": {"type": "string"},
-                                        "purchase_order_date": {"type": "string"},
-                                        "expected_delivery_date": {"type": "string"},
-                                        "vendor_id": {"type": "string"},
-                                        "account_number": {"type": "string"},
-                                        "delivery_charge": {"type": "string"},
-                                        "total_amount": {"type": "string"},
-                                        "total_taxable_value_overall": {"type": "string"},
-                                        "total_tax_amount_overall": {"type": "string"},
-                                        "amount_chargeable_in_words": {"type": "string"},
-                                        "buyer": {
-                                            "type": "object",
-                                            "properties": {
-                                                "name": {"type": "string"},
-                                                "gstin": {"type": "string"},
-                                                "state": {"type": "string"},
-                                                "address": {"type": "string"}
-                                            }
-                                        },
-                                        "supplier": {
-                                            "type": "object",
-                                            "properties": {
-                                                "name": {"type": "string"},
-                                                "gstin": {"type": "string"},
-                                                "phone": {"type": "string"},
-                                                "address": {"type": "string"}
-                                            }
-                                        },
-                                        "line_items": {
-                                            "type": "array",
-                                            "items": {
-                                                "type": "object",
-                                                "properties": {
-                                                    "product_number": {"type": "string"},
-                                                    "product_name": {"type": "string"},
-                                                    "description": {"type": "string"},
-                                                    "hsn": {"type": "string"},
-                                                    "unit_of_measure": {"type": "string"},
-                                                    "quantity_ordered": {"type": "string"},
-                                                    "mrp": {"type": "string"},
-                                                    "price_per_unit": {"type": "string"},
-                                                    "margin_percentage": {"type": "string"},
-                                                    "gst_rate": {"type": "string"},
-                                                    "total_amount_item": {"type": "string"},
-                                                    "total_tax_amount_item": {"type": "string"}
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        )
-
-                        # Poll for completion
-                        max_wait = 300
-                        wait_interval = 10
-                        elapsed = 0
-
-                        while elapsed < max_wait:
-                            job = client.extract.get(job.id)
-                            status = (job.status or "").upper()
-                            if status in ("SUCCESS", "COMPLETED"):
-                                self.log(f"Extraction completed for {file['name']} (status={job.status})", "SUCCESS")
-                                # ========== FIX: extract_result is where data lives ==========
-                                extracted_data = (
-                                    getattr(job, 'extract_result', None) or
-                                    getattr(job, 'data', None) or
-                                    getattr(job, 'result', None) or
-                                    getattr(getattr(job, 'extraction', None), 'data', None) or
-                                    getattr(getattr(job, 'output', None), 'data', None) or
-                                    getattr(job, 'extracted_data', None) or
-                                    getattr(job, 'json_result', None)
-                                )
-                                if extracted_data is None:
-                                    self.log(f"WARNING: Could not find data in job. Full job: {vars(job)}", "WARNING")
-                                break
-                            elif status in ("FAILED", "ERROR", "CANCELLED"):
-                                self.log(f"Extraction failed for {file['name']}: status={job.status}", "ERROR")
-                                break
-                            self.log(f"Extraction status: {job.status} ({elapsed}s elapsed)", "INFO")
-                            time.sleep(wait_interval)
-                            elapsed += wait_interval
-                        else:
-                            self.log(f"Extraction timed out after {max_wait}s for {file['name']}", "ERROR")
-
-                    finally:
-                        if os.path.exists(temp_path):
-                            os.unlink(temp_path)
-
-                    if not extracted_data or not isinstance(extracted_data, dict):
-                        self.log(f"No valid extracted data for {file['name']}", "ERROR")
-                        self.current_stats['pdf']['failed_pdfs'] += 1
-                        continue
-
-                    rows = self._process_extracted_data(extracted_data, file)
-                    if rows:
-                        self._save_to_sheets(config['spreadsheet_id'], sheet_name, rows)
+                    total_attachments += attachment_count
+                    self.current_stats['gmail']['total_attachments'] += attachment_count
+                    if attachment_count > 0:
+                        self.current_stats['gmail']['successful_uploads'] += attachment_count
                         processed_count += 1
-                        self.current_stats['pdf']['processed_pdfs'] += 1
-                        self.current_stats['pdf']['rows_added'] += len(rows)
-                        total_rows += len(rows)
-                        self.log(f"Successfully processed {file['name']}: {len(rows)} rows", "SUCCESS")
+                        self.log(f"Found {attachment_count} attachments", "SUCCESS")
                     else:
-                        self.log(f"No rows extracted from {file['name']}", "WARNING")
+                        failed_count += 1
 
                     if progress_callback:
-                        progress = 40 + (i + 1) / len(files_to_process) * 55
-                        progress_callback(int(progress))
+                        progress_callback(int(50 + (i + 1) / len(emails) * 45))
 
                 except Exception as e:
-                    self.log(f"Failed to process PDF {file['name']}: {str(e)}", "ERROR")
-                    self.current_stats['pdf']['failed_pdfs'] += 1
+                    self.log(f"Failed to process email: {str(e)}", "ERROR")
+                    self.current_stats['gmail']['failed_uploads'] += 1
+                    failed_count += 1
 
             if progress_callback: progress_callback(100)
-            if status_callback: status_callback(f"PDF workflow completed! Processed {processed_count} PDFs")
-            self.log(f"PDF workflow completed! Processed {processed_count} PDFs, added {total_rows} rows", "SUCCESS")
-            return {'success': True, 'processed': processed_count, 'rows_added': total_rows}
+            if status_callback: status_callback(f"Gmail workflow completed! Processed {total_attachments} attachments")
+            self.log(f"Gmail workflow completed! {total_attachments} attachments from {processed_count} emails", "SUCCESS")
 
+            return {
+                'success': True,
+                'processed': total_attachments,
+                'total_attachments': len(emails),
+                'failed': failed_count,
+                'emails_processed': len(emails)
+            }
         except Exception as e:
-            self.log(f"PDF workflow failed: {str(e)}", "ERROR")
-            return {'success': False, 'processed': 0}
+            self.log(f"Gmail workflow failed: {str(e)}", "ERROR")
+            return {'success': False, 'processed': 0, 'total_attachments': 0, 'failed': 0, 'emails_processed': 0}
 
-    def _list_drive_files(self, folder_id: str, days_back: int) -> List[Dict]:
+    # ─────────────────────────── Drive → Sheet workflow ─────────────────────
+
+    def list_drive_pdfs(self, folder_id: str, days_back: int = 1, all_time: bool = False) -> List[Dict]:
         try:
-            # Fix deprecation warning: use timezone-aware UTC
-            start_datetime = datetime.now(timezone.utc) - timedelta(days=days_back - 1)
-            start_str = start_datetime.strftime('%Y-%m-%dT00:00:00Z')
-            query = f"'{folder_id}' in parents and mimeType='application/pdf' and trashed=false and createdTime >= '{start_str}'"
+            if all_time:
+                query = f"'{folder_id}' in parents and mimeType='application/pdf' and trashed=false"
+            else:
+                start_datetime = datetime.now(timezone.utc) - timedelta(days=days_back - 1)
+                start_str = start_datetime.strftime('%Y-%m-%dT00:00:00Z')
+                query = (
+                    f"'{folder_id}' in parents and mimeType='application/pdf' "
+                    f"and trashed=false and createdTime >= '{start_str}'"
+                )
             all_files = []
             page_token = None
             while True:
                 results = self.drive_service.files().list(
-                    q=query, fields="nextPageToken, files(id, name, mimeType, createdTime, modifiedTime)",
-                    orderBy="createdTime desc", pageSize=1000, pageToken=page_token
+                    q=query,
+                    fields="nextPageToken, files(id, name, mimeType, createdTime, modifiedTime)",
+                    orderBy="createdTime desc",
+                    pageSize=1000,
+                    pageToken=page_token
                 ).execute()
                 all_files.extend(results.get('files', []))
                 page_token = results.get('nextPageToken')
                 if not page_token:
                     break
+            label = 'all time' if all_time else f'last {days_back} days'
+            self.log(f"Found {len(all_files)} PDF files in folder ({label})", "INFO")
             return all_files
         except Exception as e:
-            self.log(f"Failed to list files: {str(e)}", "ERROR")
+            self.log(f"Failed to list PDFs: {str(e)}", "ERROR")
             return []
 
-    def _download_from_drive(self, file_id: str, file_name: str) -> bytes:
+    def download_from_drive(self, file_id: str, file_name: str) -> bytes:
         try:
-            return self.drive_service.files().get_media(fileId=file_id).execute()
+            self.log(f"Downloading: {file_name}", "INFO")
+            data = self.drive_service.files().get_media(fileId=file_id).execute()
+            self.log(f"Downloaded: {file_name}", "SUCCESS")
+            return data
         except Exception as e:
             self.log(f"Failed to download {file_name}: {str(e)}", "ERROR")
             return b""
 
-    def _process_extracted_data(self, extracted_data: Dict, file_info: Dict) -> List[Dict]:
+    def get_existing_drive_ids(self, spreadsheet_id: str, sheet_range: str) -> set:
+        try:
+            result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id, range=sheet_range, majorDimension="ROWS"
+            ).execute()
+            values = result.get('values', [])
+            if not values:
+                return set()
+            headers = values[0]
+            if "drive_file_id" not in headers:
+                self.log("No 'drive_file_id' column found in sheet", "WARNING")
+                return set()
+            id_index = headers.index("drive_file_id")
+            ids = {row[id_index] for row in values[1:] if len(row) > id_index and row[id_index]}
+            self.log(f"Found {len(ids)} existing file IDs in sheet", "INFO")
+            return ids
+        except Exception as e:
+            self.log(f"Failed to get existing file IDs: {str(e)}", "ERROR")
+            return set()
+
+    def get_existing_filenames(self, spreadsheet_id: str, sheet_range: str) -> set:
+        try:
+            result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id, range=sheet_range, majorDimension="ROWS"
+            ).execute()
+            values = result.get('values', [])
+            if not values:
+                return set()
+            headers = values[0]
+            if "source_file" not in headers:
+                return set()
+            id_index = headers.index("source_file")
+            names = {row[id_index] for row in values[1:] if len(row) > id_index and row[id_index]}
+            self.log(f"Found {len(names)} existing file names in sheet", "INFO")
+            return names
+        except Exception as e:
+            self.log(f"Failed to get existing file names: {str(e)}", "ERROR")
+            return set()
+
+    def safe_extract(self, client, tmp_path: str, file_info: Dict, config: dict, retries: int = 5):
+        """Upload PDF to LlamaCloud and poll until extraction completes."""
+        for attempt in range(1, retries + 1):
+            try:
+                self.log(f"Extracting data (attempt {attempt}/{retries})...", "INFO")
+                with open(tmp_path, "rb") as f:
+                    file_obj = client.files.create(file=f, purpose="extract")
+                file_id = file_obj.id
+
+                job = client.extract.create(
+                    file_input=file_id,
+                    configuration={
+                        "agent_name": config['llama_agent'],
+                        "extraction_target": "per_doc",
+                        "tier": "agentic",
+                        "data_schema": {
+                            "type": "object",
+                            "properties": {
+                                "purchase_order_number": {"type": "string"},
+                                "purchase_order_date": {"type": "string"},
+                                "expected_delivery_date": {"type": "string"},
+                                "vendor_id": {"type": "string"},
+                                "account_number": {"type": "string"},
+                                "delivery_charge": {"type": "string"},
+                                "total_amount": {"type": "string"},
+                                "total_taxable_value_overall": {"type": "string"},
+                                "total_tax_amount_overall": {"type": "string"},
+                                "amount_chargeable_in_words": {"type": "string"},
+                                "buyer": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "gstin": {"type": "string"},
+                                        "state": {"type": "string"},
+                                        "address": {"type": "string"}
+                                    }
+                                },
+                                "supplier": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "gstin": {"type": "string"},
+                                        "phone": {"type": "string"},
+                                        "address": {"type": "string"}
+                                    }
+                                },
+                                "line_items": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "product_number": {"type": "string"},
+                                            "product_name": {"type": "string"},
+                                            "description": {"type": "string"},
+                                            "hsn": {"type": "string"},
+                                            "unit_of_measure": {"type": "string"},
+                                            "quantity_ordered": {"type": "string"},
+                                            "mrp": {"type": "string"},
+                                            "price_per_unit": {"type": "string"},
+                                            "margin_percentage": {"type": "string"},
+                                            "gst_rate": {"type": "string"},
+                                            "total_amount_item": {"type": "string"},
+                                            "total_tax_amount_item": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                )
+
+                # Poll for completion
+                max_wait, wait_interval, elapsed = 300, 10, 0
+                while elapsed < max_wait:
+                    job = client.extract.get(job.id)
+                    status = (job.status or "").upper()
+                    if status in ("SUCCESS", "COMPLETED"):
+                        self.log(f"Extraction completed (status={job.status})", "SUCCESS")
+                        extracted_data = (
+                            getattr(job, 'extract_result', None) or
+                            getattr(job, 'data', None) or
+                            getattr(job, 'result', None) or
+                            getattr(getattr(job, 'extraction', None), 'data', None) or
+                            getattr(getattr(job, 'output', None), 'data', None) or
+                            getattr(job, 'extracted_data', None) or
+                            getattr(job, 'json_result', None)
+                        )
+                        if extracted_data is None:
+                            self.log(f"WARNING: Could not find data in job. Full job: {vars(job)}", "WARNING")
+                        return extracted_data
+                    elif status in ("FAILED", "ERROR", "CANCELLED"):
+                        self.log(f"Extraction failed: status={job.status}", "ERROR")
+                        break
+                    self.log(f"Extraction status: {job.status} ({elapsed}s elapsed)", "INFO")
+                    time.sleep(wait_interval)
+                    elapsed += wait_interval
+                else:
+                    self.log(f"Extraction timed out after {max_wait}s", "ERROR")
+
+            except Exception as e:
+                self.log(f"Extraction attempt {attempt} failed: {str(e)}", "WARNING")
+                time.sleep(RETRY_WAIT)
+
+        self.log(f"Extraction failed after {retries} attempts", "ERROR")
+        return None
+
+    def process_extracted_data(self, extracted_data: Dict, file_info: Dict) -> List[Dict]:
         rows = []
-        # Handle both direct dict and nested "data" wrapper
         data = extracted_data.get("data", extracted_data)
         line_items = data.get("line_items") or data.get("items")
         if not line_items:
             self.log(f"Skipping (no line_items): {file_info['name']}", "WARNING")
             return rows
 
-        # Header fields
-        po_number = self._get_value(data, ["purchase_order_number", "po_number", "PO No"])
-        po_date = self._get_value(data, ["purchase_order_date", "po_date"])
-        expected_delivery_date = self._get_value(data, ["expected_delivery_date", "delivery_date"])
-        vendor_id = self._get_value(data, ["vendor_id"])
-        account_number = self._get_value(data, ["account_number"])
-        delivery_charge = self._get_value(data, ["delivery_charge"])
-        total_amount = self._get_value(data, ["total_amount"])
-        total_taxable_value = self._get_value(data, ["total_taxable_value_overall"])
-        total_tax_amount = self._get_value(data, ["total_tax_amount_overall"])
-        amount_chargeable_in_words = self._get_value(data, ["amount_chargeable_in_words"])
+        def _get(d, keys, default=""):
+            for k in keys:
+                if k in d:
+                    return d[k]
+            return default
 
+        po_number = _get(data, ["purchase_order_number", "po_number", "PO No"])
+        po_date = _get(data, ["purchase_order_date", "po_date"])
+        expected_delivery_date = _get(data, ["expected_delivery_date", "delivery_date"])
+        vendor_id = _get(data, ["vendor_id"])
+        account_number = _get(data, ["account_number"])
+        delivery_charge = _get(data, ["delivery_charge"])
+        total_amount = _get(data, ["total_amount"])
+        total_taxable_value = _get(data, ["total_taxable_value_overall"])
+        total_tax_amount = _get(data, ["total_tax_amount_overall"])
+        amount_chargeable_in_words = _get(data, ["amount_chargeable_in_words"])
         buyer = data.get("buyer", {}) or {}
         supplier = data.get("supplier", {}) or {}
 
@@ -685,73 +640,281 @@ class MilkbasketAutomation:
             rows.append(cleaned_row)
         return rows
 
-    def _get_value(self, data, possible_keys, default=""):
-        for key in possible_keys:
-            if key in data:
-                return data[key]
-        return default
-
-    def _save_to_sheets(self, spreadsheet_id: str, sheet_name: str, rows: List[Dict]):
+    def save_failed_extractions(self, spreadsheet_id: str, sheet_name: str, failed_files: List[Dict]):
+        """Save failed/incomplete extraction details to a dedicated sheet."""
         try:
-            if not rows: return
-            self._ensure_sheet_exists(spreadsheet_id, sheet_name)
-            existing_headers = self._get_sheet_headers(spreadsheet_id, sheet_name)
-            new_headers = list(rows[0].keys())  # preserve insertion order from first row
-
-            if existing_headers:
-                # Merge any new columns not yet in the sheet
-                all_headers = existing_headers.copy()
-                for h in new_headers:
-                    if h not in all_headers:
-                        all_headers.append(h)
-                if len(all_headers) > len(existing_headers):
-                    self._update_headers(spreadsheet_id, sheet_name, all_headers)
-            else:
-                # Sheet is empty — write header row FIRST, then data rows separately
-                all_headers = new_headers
-                self._update_headers(spreadsheet_id, sheet_name, all_headers)
-
-            # Build data-only rows (never include the header here)
-            # Duplicate check is done upstream — just append new rows
-            values = [[row.get(h, "") for h in all_headers] for row in rows]
-            self._append_to_google_sheet(spreadsheet_id, sheet_name, values)
+            self.sheets_service.spreadsheets().values().clear(
+                spreadsheetId=spreadsheet_id, range=sheet_name, body={}
+            ).execute()
+            headers = [['Timestamp', 'File Name', 'File ID', 'Status',
+                        'Items Extracted', 'Completeness Score', 'Issues', 'Attempts', 'Strategy Used']]
+            self.append_to_google_sheet(spreadsheet_id, sheet_name, headers)
+            data = [[
+                f.get('timestamp', ''), f.get('file_name', ''), f.get('file_id', ''),
+                f.get('status', ''), f.get('items_extracted', 0),
+                f"{f.get('completeness_score', 0):.2%}",
+                '; '.join(f.get('issues', [])), f.get('attempts', 0), f.get('strategy_used', '')
+            ] for f in failed_files]
+            if data:
+                self.append_to_google_sheet(spreadsheet_id, sheet_name, data)
+                self.log(f"Saved {len(failed_files)} failed/incomplete extractions to {sheet_name}", "INFO")
         except Exception as e:
-            self.log(f"Failed to save to sheets: {str(e)}", "ERROR")
+            self.log(f"Failed to save failed extractions: {str(e)}", "ERROR")
 
-    def _get_sheet_headers(self, spreadsheet_id: str, sheet_name: str) -> List[str]:
+    def process_pdf_workflow(self, config: dict, progress_callback=None, status_callback=None):
+        stats = {
+            'total_pdfs': 0, 'processed_pdfs': 0, 'failed_pdfs': 0,
+            'skipped_pdfs': 0, 'rows_added': 0, 'incomplete': 0
+        }
+
+        if not LLAMA_AVAILABLE:
+            self.log("llama-cloud not installed. Run: pip install llama-cloud>=2.1", "ERROR")
+            return {'success': False, **stats}
+
+        try:
+            if status_callback: status_callback("Starting PDF processing workflow...")
+            self.log("Starting PDF processing workflow with LlamaCloud SDK...", "INFO")
+            if progress_callback: progress_callback(20)
+
+            os.environ.setdefault('LLAMA_CLOUD_API_KEY', config['llama_api_key'])
+            client = LlamaCloud(api_key=config['llama_api_key'])
+
+            if progress_callback: progress_callback(40)
+
+            existing_file_ids = self.get_existing_drive_ids(config['spreadsheet_id'], config['sheet_range'])
+            existing_file_names = self.get_existing_filenames(config['spreadsheet_id'], config['sheet_range'])
+            pdf_files = self.list_drive_pdfs(config['drive_folder_id'], config['days_back'])
+            stats['total_pdfs'] = len(pdf_files)
+            self.current_stats['pdf']['total_pdfs'] = len(pdf_files)
+
+            skipped, files_to_process = [], []
+            for f in pdf_files:
+                if f['id'] in existing_file_ids:
+                    self.log(f"Skipping (drive_file_id already in sheet): {f['name']}", "INFO")
+                    skipped.append(f)
+                elif f['name'] in existing_file_names:
+                    self.log(f"Skipping (filename already in sheet): {f['name']}", "INFO")
+                    skipped.append(f)
+                else:
+                    files_to_process.append(f)
+
+            stats['skipped_pdfs'] = len(skipped)
+            self.current_stats['pdf']['skipped_pdfs'] += len(skipped)
+            files_to_process = files_to_process[:config.get('max_files', len(files_to_process))]
+
+            if not files_to_process:
+                self.log("No PDF files to process", "WARNING")
+                return {'success': True, **stats}
+
+            self.log(f"Processing {len(files_to_process)} PDFs using agent '{config['llama_agent']}'", "INFO")
+
+            sheet_name = config['sheet_range'].split('!')[0]
+            sheet_id = self.get_sheet_id(config['spreadsheet_id'], sheet_name)
+            headers = self.get_sheet_headers(config['spreadsheet_id'], sheet_name)
+            headers_set = bool(headers)
+            incomplete_extractions = []
+
+            for i, file in enumerate(files_to_process):
+                try:
+                    if status_callback: status_callback(f"Processing PDF {i+1}/{len(files_to_process)}: {file['name']}")
+                    self.log(f"Processing: {file['name']}", "INFO")
+
+                    pdf_data = self.download_from_drive(file['id'], file['name'])
+                    if not pdf_data:
+                        stats['failed_pdfs'] += 1
+                        self.current_stats['pdf']['failed_pdfs'] += 1
+                        incomplete_extractions.append({
+                            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            'file_name': file['name'], 'file_id': file['id'],
+                            'status': 'Download Failed', 'items_extracted': 0,
+                            'completeness_score': 0, 'issues': ['Failed to download from Drive'],
+                            'attempts': 0, 'strategy_used': 'N/A'
+                        })
+                        continue
+
+                    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_file:
+                        tmp_file.write(pdf_data)
+                        tmp_path = tmp_file.name
+
+                    extracted_data = None
+                    try:
+                        extracted_data = self.safe_extract(client, tmp_path, file, config, retries=5)
+                    finally:
+                        if os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
+
+                    if not extracted_data or not isinstance(extracted_data, dict):
+                        self.log(f"No valid extracted data for {file['name']}", "ERROR")
+                        stats['failed_pdfs'] += 1
+                        self.current_stats['pdf']['failed_pdfs'] += 1
+                        incomplete_extractions.append({
+                            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            'file_name': file['name'], 'file_id': file['id'],
+                            'status': 'Extraction Failed', 'items_extracted': 0,
+                            'completeness_score': 0, 'issues': ['All extraction attempts failed'],
+                            'attempts': 5, 'strategy_used': 'standard_retry'
+                        })
+                        continue
+
+                    rows_data = self.process_extracted_data(extracted_data, file)
+
+                    if not rows_data:
+                        self.log(f"No rows extracted from {file['name']}", "WARNING")
+                        stats['failed_pdfs'] += 1
+                        self.current_stats['pdf']['failed_pdfs'] += 1
+                        incomplete_extractions.append({
+                            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            'file_name': file['name'], 'file_id': file['id'],
+                            'status': 'No Rows Extracted', 'items_extracted': 0,
+                            'completeness_score': 0, 'issues': ['No rows after processing'],
+                            'attempts': 5, 'strategy_used': 'standard_retry'
+                        })
+                        continue
+
+                    # Merge / update headers
+                    if not headers_set:
+                        all_keys = set()
+                        for row in rows_data:
+                            all_keys.update(row.keys())
+                        new_headers = sorted(list(all_keys))
+                        if headers:
+                            combined = list(dict.fromkeys(headers + new_headers))
+                            if combined != headers:
+                                self.update_headers(config['spreadsheet_id'], sheet_name, combined)
+                                headers = combined
+                        else:
+                            self.update_headers(config['spreadsheet_id'], sheet_name, new_headers)
+                            headers = new_headers
+                        headers_set = True
+
+                    sheet_rows = [[row.get(h, "") for h in headers] for row in rows_data]
+
+                    if self.replace_rows_for_file(
+                        spreadsheet_id=config['spreadsheet_id'],
+                        sheet_name=sheet_name,
+                        file_id=file['id'],
+                        headers=headers,
+                        new_rows=sheet_rows,
+                        sheet_id=sheet_id
+                    ):
+                        stats['processed_pdfs'] += 1
+                        stats['rows_added'] += len(sheet_rows)
+                        self.current_stats['pdf']['processed_pdfs'] += 1
+                        self.current_stats['pdf']['rows_added'] += len(sheet_rows)
+                        self.log(f"Successfully processed {file['name']}: {len(sheet_rows)} rows", "SUCCESS")
+                    else:
+                        stats['failed_pdfs'] += 1
+                        self.current_stats['pdf']['failed_pdfs'] += 1
+                        self.log(f"Failed to append data for {file['name']}", "ERROR")
+
+                    if progress_callback:
+                        progress_callback(int(40 + (i + 1) / len(files_to_process) * 55))
+
+                except Exception as e:
+                    self.log(f"Failed to process PDF {file.get('name', 'unknown')}: {str(e)}", "ERROR")
+                    stats['failed_pdfs'] += 1
+                    self.current_stats['pdf']['failed_pdfs'] += 1
+                    incomplete_extractions.append({
+                        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        'file_name': file.get('name', 'unknown'), 'file_id': file.get('id', ''),
+                        'status': 'Processing Error', 'items_extracted': 0,
+                        'completeness_score': 0, 'issues': [str(e)],
+                        'attempts': 0, 'strategy_used': 'N/A'
+                    })
+
+            if incomplete_extractions:
+                failed_sheet = config.get('failed_extractions_sheet', 'failed_extractions')
+                self.save_failed_extractions(config['spreadsheet_id'], failed_sheet, incomplete_extractions)
+                stats['incomplete'] = len(incomplete_extractions)
+
+            if progress_callback: progress_callback(100)
+            if status_callback: status_callback(f"PDF workflow completed! Processed {stats['processed_pdfs']} PDFs")
+            self.log(
+                f"PDF workflow completed! Processed {stats['processed_pdfs']} PDFs, "
+                f"added {stats['rows_added']} rows, failed {stats['failed_pdfs']}", "SUCCESS"
+            )
+
+            return {'success': True, **stats}
+
+        except Exception as e:
+            self.log(f"PDF workflow failed: {str(e)}", "ERROR")
+            return {'success': False, **stats}
+
+    # ─────────────────────── Remaining files tracker ────────────────────────
+
+    def save_remaining_files(self, spreadsheet_id: str, sheet_name: str, files: List[Dict]):
+        try:
+            self.sheets_service.spreadsheets().values().clear(
+                spreadsheetId=spreadsheet_id, range=sheet_name, body={}
+            ).execute()
+            self.log(f"Cleared existing data in {sheet_name}", "INFO")
+            headers = [['File Name', 'File ID', 'Created Time']]
+            self.append_to_google_sheet(spreadsheet_id, sheet_name, headers)
+            data = [[f['name'], f['id'], f.get('createdTime', '')] for f in files]
+            success = self.append_to_google_sheet(spreadsheet_id, sheet_name, data)
+            if success:
+                self.log(f"Saved {len(files)} remaining files to {sheet_name}", "SUCCESS")
+            return success
+        except Exception as e:
+            self.log(f"Failed to save remaining files: {str(e)}", "ERROR")
+            return False
+
+    # ──────────────────────── Google Sheets helpers ─────────────────────────
+
+    def get_sheet_headers(self, spreadsheet_id: str, sheet_name: str) -> List[str]:
         try:
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id, range=f"{sheet_name}!A1:Z1", majorDimension="ROWS"
             ).execute()
-            return result.get('values', [[]])[0]
-        except:
+            values = result.get('values', [])
+            return values[0] if values else []
+        except Exception:
             return []
 
-    def _col_to_letter(self, n: int) -> str:
-        """Convert 1-based column index to spreadsheet letters, e.g. 1→A, 26→Z, 27→AA."""
-        result = ""
-        while n > 0:
-            n, remainder = divmod(n - 1, 26)
-            result = chr(65 + remainder) + result
-        return result
-
-    def _update_headers(self, spreadsheet_id: str, sheet_name: str, headers: List[str]) -> bool:
+    def update_headers(self, spreadsheet_id: str, sheet_name: str, new_headers: List[str]) -> bool:
         try:
-            body = {'values': [headers]}
-            last_col = self._col_to_letter(len(headers))
+            body = {'values': [new_headers]}
+            last_col = self._col_to_letter(len(new_headers))
             self.sheets_service.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
                 range=f"{sheet_name}!A1:{last_col}1",
                 valueInputOption='USER_ENTERED',
                 body=body
             ).execute()
-            self.log(f"Updated headers with {len(headers)} columns", "INFO")
+            self.log(f"Updated headers with {len(new_headers)} columns", "INFO")
             return True
         except Exception as e:
             self.log(f"Failed to update headers: {str(e)}", "ERROR")
             return False
 
-    def _get_sheet_id(self, spreadsheet_id: str, sheet_name: str) -> int:
+    def append_to_google_sheet(self, spreadsheet_id: str, range_name: str, values: List[List[Any]]) -> bool:
+        for attempt in range(1, 4):
+            try:
+                body = {'values': values}
+                self.sheets_service.spreadsheets().values().append(
+                    spreadsheetId=spreadsheet_id, range=range_name,
+                    valueInputOption='USER_ENTERED', body=body
+                ).execute()
+                return True
+            except Exception as e:
+                if attempt < 3:
+                    time.sleep(RETRY_WAIT)
+                else:
+                    self.log(f"Failed to append after 3 attempts: {str(e)}", "ERROR")
+                    return False
+        return False
+
+    def get_sheet_data(self, spreadsheet_id: str, sheet_name: str) -> List[List[str]]:
+        try:
+            result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id, range=sheet_name, majorDimension="ROWS"
+            ).execute()
+            return result.get('values', [])
+        except Exception as e:
+            self.log(f"Failed to get sheet data: {str(e)}", "ERROR")
+            return []
+
+    def get_sheet_id(self, spreadsheet_id: str, sheet_name: str) -> int:
         try:
             metadata = self.sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
             for sheet in metadata.get('sheets', []):
@@ -762,145 +925,212 @@ class MilkbasketAutomation:
             self.log(f"Failed to get sheet ID: {str(e)}", "ERROR")
             return 0
 
-    def _get_sheet_data(self, spreadsheet_id: str, sheet_name: str) -> List[List[str]]:
-        try:
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id, range=sheet_name, majorDimension="ROWS"
-            ).execute()
-            return result.get('values', [])
-        except Exception as e:
-            self.log(f"Failed to get sheet data: {str(e)}", "ERROR")
-            return []
-
-    def _replace_rows_for_file(self, spreadsheet_id: str, sheet_name: str, file_name: str, headers: List[str], new_rows: List[List[Any]], sheet_id: int) -> bool:
-        try:
-            values = self._get_sheet_data(spreadsheet_id, sheet_name)
-            if not values:
-                return self._append_to_google_sheet(spreadsheet_id, sheet_name, new_rows)
-            current_headers = values[0]
-            try:
-                file_col = current_headers.index('source_file')
-            except ValueError:
-                return self._append_to_google_sheet(spreadsheet_id, sheet_name, new_rows)
-
-            data_rows = values[1:]  # rows after the header
-            rows_to_delete = [idx for idx, row in enumerate(data_rows, 2) if len(row) > file_col and row[file_col] == file_name]
-            if rows_to_delete:
-                rows_to_delete.sort(reverse=True)
-                requests = [{'deleteDimension': {'range': {'sheetId': sheet_id, 'dimension': 'ROWS', 'startIndex': r-1, 'endIndex': r}}} for r in rows_to_delete]
-                self.sheets_service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={'requests': requests}).execute()
-                self.log(f"Deleted {len(rows_to_delete)} existing rows for {file_name}", "INFO")
-
-            return self._append_to_google_sheet(spreadsheet_id, sheet_name, new_rows)
-        except Exception as e:
-            self.log(f"Failed to replace rows: {str(e)}", "ERROR")
-            return False
-
-    def _append_to_google_sheet(self, spreadsheet_id: str, range_name: str, values: List[List[Any]]) -> bool:
-        for attempt in range(1, 4):
-            try:
-                body = {'values': values}
-                self.sheets_service.spreadsheets().values().append(
-                    spreadsheetId=spreadsheet_id, range=range_name, valueInputOption='USER_ENTERED', body=body
-                ).execute()
-                return True
-            except Exception as e:
-                if attempt < 3:
-                    time.sleep(2)
-                else:
-                    self.log(f"Failed to append after 3 attempts: {str(e)}", "ERROR")
-                    return False
-        return False
-
     def _ensure_sheet_exists(self, spreadsheet_id: str, sheet_name: str):
         try:
             metadata = self.sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
             existing = [s['properties']['title'] for s in metadata.get('sheets', [])]
             if sheet_name not in existing:
                 body = {'requests': [{'addSheet': {'properties': {'title': sheet_name}}}]}
-                self.sheets_service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
+                self.sheets_service.spreadsheets().batchUpdate(
+                    spreadsheetId=spreadsheet_id, body=body
+                ).execute()
                 self.log(f"Created sheet tab: {sheet_name}", "INFO")
         except Exception as e:
             self.log(f"Failed to ensure sheet exists: {str(e)}", "WARNING")
 
-    def _log_workflow_to_sheet(self, spreadsheet_id: str, sheet_range: str, start_time: datetime, end_time: datetime, stats: Dict):
+    def replace_rows_for_file(self, spreadsheet_id: str, sheet_name: str, file_id: str,
+                               headers: List[str], new_rows: List[List[Any]], sheet_id: int) -> bool:
         try:
-            sheet_name = sheet_range.split('!')[0] if '!' in sheet_range else sheet_range
-            self._ensure_sheet_exists(spreadsheet_id, sheet_name)
-            headers = [
-                "Start Time", "End Time",
-                "Gmail Processed Emails", "Gmail Total Attachments", "Gmail Successful Uploads", "Gmail Failed Uploads",
-                "PDF Total PDFs", "PDF Processed PDFs", "PDF Skipped PDFs", "PDF Failed PDFs", "PDF Rows Added"
+            values = self.get_sheet_data(spreadsheet_id, sheet_name)
+            if not values:
+                return self.append_to_google_sheet(spreadsheet_id, sheet_name, new_rows)
+            current_headers = values[0]
+            try:
+                file_col = current_headers.index('drive_file_id')
+            except ValueError:
+                return self.append_to_google_sheet(spreadsheet_id, sheet_name, new_rows)
+
+            data_rows = values[1:]
+            rows_to_delete = [
+                idx for idx, row in enumerate(data_rows, 2)
+                if len(row) > file_col and row[file_col] == file_id
             ]
+            if rows_to_delete:
+                rows_to_delete.sort(reverse=True)
+                requests = [{
+                    'deleteDimension': {
+                        'range': {'sheetId': sheet_id, 'dimension': 'ROWS', 'startIndex': r - 1, 'endIndex': r}
+                    }
+                } for r in rows_to_delete]
+                self.sheets_service.spreadsheets().batchUpdate(
+                    spreadsheetId=spreadsheet_id, body={'requests': requests}
+                ).execute()
+                self.log(f"Deleted {len(rows_to_delete)} existing rows for file {file_id}", "INFO")
+            return self.append_to_google_sheet(spreadsheet_id, sheet_name, new_rows)
+        except Exception as e:
+            self.log(f"Failed to replace rows: {str(e)}", "ERROR")
+            return False
+
+    def _col_to_letter(self, n: int) -> str:
+        result = ""
+        while n > 0:
+            n, remainder = divmod(n - 1, 26)
+            result = chr(65 + remainder) + result
+        return result
+
+    # ─────────────────── Workflow logging to Google Sheet ───────────────────
+
+    def log_workflow_to_sheet(self, workflow_name: str, start_time: datetime, end_time: datetime, stats: dict):
+        try:
+            duration = (end_time - start_time).total_seconds()
+            duration_str = f"{duration:.2f}s"
+            if duration >= 60:
+                duration_str = f"{int(duration // 60)}m {int(duration % 60)}s"
+
             log_row = [
                 start_time.strftime("%Y-%m-%d %H:%M:%S"),
                 end_time.strftime("%Y-%m-%d %H:%M:%S"),
-                stats['gmail']['processed_emails'],
-                stats['gmail']['total_attachments'],
-                stats['gmail']['successful_uploads'],
-                stats['gmail']['failed_uploads'],
-                stats['pdf']['total_pdfs'],
-                stats['pdf']['processed_pdfs'],
-                stats['pdf']['skipped_pdfs'],
-                stats['pdf']['failed_pdfs'],
-                stats['pdf']['rows_added']
+                duration_str,
+                workflow_name,
+                stats.get('processed', stats.get('processed_pdfs', 0)),
+                stats.get('total_attachments', stats.get('rows_added', 0)),
+                stats.get('failed', stats.get('failed_pdfs', 0)),
+                stats.get('skipped_pdfs', 0),
+                stats.get('incomplete', 0),
+                "Success" if stats.get('success', stats.get('processed_pdfs', 0) > 0) else "Failed"
             ]
-            values = self._get_sheet_data(spreadsheet_id, sheet_name)
-            if not values or values[0] != headers:
-                self._append_to_google_sheet(spreadsheet_id, sheet_range, [headers])
-            self._append_to_google_sheet(spreadsheet_id, sheet_range, [log_row])
-            self.log("Workflow logged to sheet", "SUCCESS")
+
+            log_config = CONFIG['workflow_log']
+            self._ensure_sheet_exists(log_config['spreadsheet_id'], log_config['sheet_range'])
+            existing_headers = self.get_sheet_headers(log_config['spreadsheet_id'], log_config['sheet_range'])
+            if not existing_headers:
+                header_row = ["Start Time", "End Time", "Duration", "Workflow",
+                              "Processed", "Total Items", "Failed", "Skipped", "Incomplete", "Status"]
+                self.append_to_google_sheet(log_config['spreadsheet_id'], log_config['sheet_range'], [header_row])
+
+            self.append_to_google_sheet(log_config['spreadsheet_id'], log_config['sheet_range'], [log_row])
+            self.log(f"Logged workflow '{workflow_name}' to sheet", "INFO")
+
         except Exception as e:
             self.log(f"Failed to log workflow: {str(e)}", "ERROR")
 
+    # ────────────────────────── Scheduled entry point ───────────────────────
 
-def run_combined_workflow(automation):
-    start_time = datetime.now()
-    automation.log("Starting combined workflow...")
-    automation.reset_stats()
-    
-    gmail_config = CONFIG['gmail']
-    pdf_config = CONFIG['pdf']
-    
-    def update_progress(value): automation.log(f"Progress: {value}%")
-    def update_status(message): automation.log(message)
-    
-    gmail_result = automation.process_gmail_workflow(gmail_config, progress_callback=update_progress, status_callback=update_status)
-    
-    if not gmail_result.get('success'):
-        automation.log("Gmail workflow failed", "ERROR")
-        end_time = datetime.now()
-        automation._log_workflow_to_sheet(pdf_config['spreadsheet_id'], CONFIG['log']['sheet_range'], start_time, end_time, automation.current_stats)
-        return {"status": "failed"}
-    
-    pdf_result = automation.process_pdf_workflow(pdf_config, progress_callback=update_progress, status_callback=update_status)
-    
-    end_time = datetime.now()
-    automation.log(f"Combined workflow completed! Gmail: {gmail_result.get('processed',0)} attachments | PDF: {pdf_result.get('processed',0)} PDFs, {pdf_result.get('rows_added',0)} rows", "SUCCESS")
-    automation._log_workflow_to_sheet(pdf_config['spreadsheet_id'], CONFIG['log']['sheet_range'], start_time, end_time, automation.current_stats)
-    
-    return {
-        "status": "success",
-        "gmail_attachments": gmail_result.get('processed', 0),
-        "pdf_pdfs": pdf_result.get('processed', 0),
-        "pdf_skipped": automation.current_stats['pdf']['skipped_pdfs'],
-        "pdf_rows": pdf_result.get('rows_added', 0)
-    }
+    def run_scheduled_workflow(self):
+        """Run both workflows in sequence and log results. Called by GitHub Actions."""
+        try:
+            self.log("=" * 80)
+            self.log("STARTING MILKBASKET SCHEDULED WORKFLOW RUN")
+            self.log("=" * 80)
 
+            overall_start = datetime.now(timezone.utc)
+            self.reset_stats()
+
+            # ── Workflow 1: Gmail → Drive ──
+            self.log("\n[WORKFLOW 1/2] Starting Gmail → Drive workflow...")
+            mail_start = datetime.now(timezone.utc)
+            gmail_result = self.process_gmail_workflow(CONFIG['gmail'])
+            mail_end = datetime.now(timezone.utc)
+            self.log_workflow_to_sheet("Gmail to Drive", mail_start, mail_end, gmail_result)
+
+            time.sleep(5)
+
+            # ── Workflow 2: Drive → Sheet ──
+            self.log("\n[WORKFLOW 2/2] Starting Drive → Sheet workflow...")
+            sheet_start = datetime.now(timezone.utc)
+            pdf_result = self.process_pdf_workflow(CONFIG['pdf'])
+            sheet_end = datetime.now(timezone.utc)
+            self.log_workflow_to_sheet("Drive to Sheet", sheet_start, sheet_end, {
+                'processed_pdfs': pdf_result.get('processed_pdfs', 0),
+                'rows_added': pdf_result.get('rows_added', 0),
+                'failed_pdfs': pdf_result.get('failed_pdfs', 0),
+                'skipped_pdfs': pdf_result.get('skipped_pdfs', 0),
+                'incomplete': pdf_result.get('incomplete', 0),
+                'success': pdf_result.get('processed_pdfs', 0) > 0
+            })
+
+            # ── Track remaining unprocessed files ──
+            drive_files = self.list_drive_pdfs(CONFIG['pdf']['drive_folder_id'], all_time=True)
+            existing_ids = self.get_existing_drive_ids(CONFIG['pdf']['spreadsheet_id'], CONFIG['pdf']['sheet_range'])
+            if len(drive_files) > len(existing_ids):
+                remaining_ids = {f['id'] for f in drive_files} - existing_ids
+                remaining_files = [f for f in drive_files if f['id'] in remaining_ids]
+                self.save_remaining_files(
+                    CONFIG['remaining_files']['spreadsheet_id'],
+                    CONFIG['remaining_files']['sheet_range'],
+                    remaining_files
+                )
+
+            overall_end = datetime.now(timezone.utc)
+            total_duration = (overall_end - overall_start).total_seconds()
+            duration_str = (
+                f"{int(total_duration // 60)}m {int(total_duration % 60)}s"
+                if total_duration >= 60 else f"{total_duration:.2f}s"
+            )
+
+            self.log("\n" + "=" * 80)
+            self.log("MILKBASKET SCHEDULED WORKFLOW RUN COMPLETED")
+            self.log(f"Total Duration : {duration_str}")
+            self.log(f"Gmail → Drive  : {gmail_result.get('processed', 0)} attachments from "
+                     f"{gmail_result.get('emails_processed', 0)} emails")
+            self.log(f"Drive → Sheet  : {pdf_result.get('processed_pdfs', 0)} PDFs processed, "
+                     f"{pdf_result.get('rows_added', 0)} rows added")
+            self.log("=" * 80 + "\n")
+
+            return {
+                'status': 'success',
+                'duration': duration_str,
+                'gmail_attachments': gmail_result.get('processed', 0),
+                'pdf_pdfs': pdf_result.get('processed_pdfs', 0),
+                'pdf_skipped': pdf_result.get('skipped_pdfs', 0),
+                'pdf_rows': pdf_result.get('rows_added', 0),
+            }
+
+        except Exception as e:
+            self.log(f"Scheduled workflow failed: {str(e)}", "ERROR")
+            return None
+
+
+# ──────────────────────────────── Entry points ──────────────────────────────
 
 def main():
-    """Run a single workflow execution and exit. Scheduling is handled by GitHub Actions."""
+    """Run once immediately, then keep a 3-hour schedule (for local / persistent runner use)."""
+    print("=" * 80)
+    print("MILKBASKET GRN AUTOMATION SCHEDULER")
+    print("Runs every 3 hours: Gmail → Drive → Sheet")
+    print("=" * 80)
+
     automation = MilkbasketAutomation()
 
+    print("\nAuthenticating...")
     if not automation.authenticate():
-        logger.error("Authentication failed. Exiting.")
-        sys.exit(1)
+        print("ERROR: Authentication failed. Please check credentials.")
+        return
 
-    result = run_combined_workflow(automation)
-    logger.info(f"Workflow result: {result}")
+    print("Authentication successful!")
+    print("\nRunning initial workflow...")
+    summary = automation.run_scheduled_workflow()
 
-    if result.get("status") != "success":
-        sys.exit(1)
+    if summary:
+        print(f"\nWorkflow Summary:")
+        print(f"  Gmail → Drive  : {summary['gmail_attachments']} attachments uploaded")
+        print(f"  Drive → Sheet  : {summary['pdf_pdfs']} files processed, {summary['pdf_rows']} rows added")
+        print(f"  Duration       : {summary['duration']}")
+
+    # Schedule future runs (local mode only — GitHub Actions uses cron instead)
+    schedule.every(3).hours.do(automation.run_scheduled_workflow)
+    print(f"\nScheduler started. Next run in 3 hours.")
+    print(f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("Press Ctrl+C to stop.\n")
+
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("\n\nScheduler stopped by user.")
+        print("=" * 80)
+
 
 if __name__ == "__main__":
     main()
