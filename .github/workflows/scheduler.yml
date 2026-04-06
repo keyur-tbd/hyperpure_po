@@ -1,4 +1,4 @@
-name: Milkbasket GRN Scheduler
+name:
 
 on:
   schedule:
